@@ -1,37 +1,64 @@
-from typing import Literal, Union
+from dataclasses import dataclass, field, asdict
+from pydantic import Field
+from typing import Generic, Literal, TypeVar, Union, Optional, Annotated
 
-from qibolab._core.components import AcquisitionConfig, DcConfig
+from qibolab._core.components import AcquisitionConfig, IqConfig, DcConfig
+from qibolab._core.serialize import NdArray
 
 __all__ = [
-    "TIIqOutputConfig",
+    "TIIqDriveConfig",
+    "TIIqFluxConfig",
+    "TIIqProbeConfig",
     "TIIqAcquisitionConfig",
     "TIIqConfigs",
 ]
 
-class TIIqOutputConfig(DcConfig):
-    """DC channel config using TIIq."""
 
-    kind: Literal["tiiq-output"] = "tiiq-output"
+class TIIqDriveConfig(IqConfig):
+    """Drive channel config for TIIq."""
+
+    kind: Literal["tiiq-drive"] = "tiiq-drive"
+
+    frequency: float
+    digital_mixer_frequency: float
+
+
+class TIIqFluxConfig(DcConfig):
+    """Flux channel config for TIIq."""
+
+    kind: Literal["tiiq-flux"] = "tiiq-flux"
 
     offset: float = 0.0
-    """DC offset to be applied in V.
+    frequency: Optional[float] = 0.0
 
-    Possible values are -0.5V to 0.5V.
-    """
+
+class TIIqProbeConfig(IqConfig):
+    """Probe channel config for TIIq."""
+
+    kind: Literal["tiiq-probe"] = "tiiq-probe"
+
+    frequency: float
+    digital_mixer_frequency: float
 
 
 class TIIqAcquisitionConfig(AcquisitionConfig):
-    """Acquisition config for TIIq."""
+    """Acquisition channel config for TIIq."""
 
     kind: Literal["tiiq-acquisition"] = "tiiq-acquisition"
+    frequency: Optional[float|None] = None
 
-    gain: int = 0
-    """Input gain in dB.
+    delay: Optional[float] = 0.0
+    """Delay between readout pulse start and acquisition start."""
+    smearing: Optional[float|None] = None
 
-    Possible values are -12dB to 20dB in steps of 1dB.
-    """
-    offset: float = 0.0
-    """Constant voltage to be applied on the input."""
+    threshold: Optional[float|None] = None
+    """Signal threshold for discriminating ground and excited states."""
+    iq_angle: Optional[float|None] = None
+    """Signal angle in the IQ-plane for disciminating ground and excited
+    states."""
+    kernel: Annotated[Optional[NdArray], Field(repr=False)] = None
+    """Integration weights to be used when post-processing the acquired
+    signal."""
 
 
-TIIqConfigs = Union[TIIqAcquisitionConfig]
+TIIqConfigs = Union[TIIqDriveConfig, TIIqFluxConfig, TIIqProbeConfig, TIIqAcquisitionConfig]
