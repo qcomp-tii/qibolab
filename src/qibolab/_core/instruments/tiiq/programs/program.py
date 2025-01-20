@@ -24,7 +24,7 @@ from qibolab._core.pulses import Acquisition, Align, Delay, Pulse, Readout, Puls
 from qibolab._core.pulses.envelope import Envelope, IqWaveform, Waveform, Rectangular, Gaussian, GaussianSquare
 from qibolab._core.sequence import PulseSequence
 
-from qick.asm_v2 import AveragerProgramV2
+from qick.asm_v2 import AveragerProgramV2, QickParam
 from qick.qick_asm import QickConfig
 
 __all__ = ["TIIqProgram"]
@@ -36,14 +36,15 @@ RAD_TO_DEG = 180/np.pi
 
 INITIALIZATION_TIME: float = 2000.0 # ns
 READOUT_LAG: float = 51 # ns
-FLUX_LAG: float = 22 # ns  # TODO Agustin to measure
+FLUX_LAG: float = 20 # ns  # TODO Agustin to measure
 
 
 class TIIqProgram(AveragerProgramV2):
     module_settings: TIIqSettings| None = None
     firmware_configuration: QickConfig
-    scheduled_sequence: list[tuple[float, float, float, ChannelId, PulseLike]]
+    scheduled_sequence: ScheduledPulseSequence
     sequence_total_duration: float
+    relaxation_time: float
 
     
     def __init__(self, *args, **kwargs):
@@ -51,10 +52,13 @@ class TIIqProgram(AveragerProgramV2):
         self.firmware_configuration = kwargs.pop("firmware_configuration")
         self.scheduled_sequence = kwargs.pop("scheduled_sequence")
         self.sequence_total_duration = kwargs.pop("sequence_total_duration")
+        self.relaxation_time = kwargs.pop("relaxation_time")
 
         kwargs["reps"] = kwargs.pop("nshots")
         kwargs["initial_delay"] = INITIALIZATION_TIME * NS_TO_US
-        kwargs["final_delay"] = kwargs.pop("relaxation_time") * NS_TO_US
+        # kwargs["final_delay"] = kwargs.pop("relaxation_time") * NS_TO_US
+        kwargs["final_delay"] = None
+        kwargs["final_wait"] = None
         kwargs["soccfg"] = self.firmware_configuration
         super().__init__(*args, **kwargs)
 
@@ -71,28 +75,32 @@ class TIIqProgram(AveragerProgramV2):
             interpolation: int = cfg['interpolation']
             maxv: int = int(cfg['maxv'] * cfg['maxv_scale'])
 
+            qick_frequency: float | QickParam = sg.frequency * HZ_TO_MHZ if not isinstance(sg.frequency, QickParam) else sg.frequency
             qick.declare_gen(
                     ch=sg.ch,
                     mixer_freq=sg.digital_mixer_frequency * HZ_TO_MHZ,
-                    nqz=1 if sg.frequency * HZ_TO_MHZ < sampling_rate / 2 else 2
+                    nqz=1 if qick_frequency < sampling_rate / 2 else 2
                 )
 
             # envelopes and pulses
             pulse: Pulse
             for pulse in sg.pulses:
+                qick_duration: float | QickParam = pulse.duration * NS_TO_US if not isinstance(pulse.duration, QickParam) else pulse.duration
+                qick_relative_phase: float | QickParam = pulse.relative_phase * RAD_TO_DEG if not isinstance(pulse.relative_phase, QickParam) else pulse.relative_phase
+
                 if isinstance(pulse.envelope, Rectangular):
                     qick.add_pulse(
                         ch=sg.ch,
-                        freq=sg.frequency * HZ_TO_MHZ, 
+                        freq=qick_frequency, 
                         # ro_ch=ro_chs[0], 
                         name=pulse.id,
                         style="const", 
-                        length=pulse.duration * NS_TO_US,
-                        phase=pulse.relative_phase * RAD_TO_DEG,
+                        length=qick_duration,
+                        phase=qick_relative_phase,
                         gain=pulse.amplitude, 
                     )
                 else:
-                    num_samples: int = int(pulse.duration*NS_TO_US*f_fabric)
+                    num_samples: int = int(qick_duration*f_fabric)
                     qick.add_envelope(
                         ch=sg.ch,
                         name=pulse.id,
@@ -108,12 +116,12 @@ class TIIqProgram(AveragerProgramV2):
                     # )
                     qick.add_pulse(
                         ch=sg.ch,
-                        freq=sg.frequency * HZ_TO_MHZ, 
+                        freq=qick_frequency, 
                         # ro_ch=ro_ch,  
                         name=pulse.id, 
                         style="arb", 
                         envelope=pulse.id,
-                        phase=pulse.relative_phase,
+                        phase=qick_relative_phase,
                         gain=pulse.amplitude, 
                     )
 
@@ -130,26 +138,30 @@ class TIIqProgram(AveragerProgramV2):
             interpolation: int = gencfg['interpolation']
             maxv: int = int(gencfg['maxv'] * gencfg['maxv_scale'])
 
+            qick_frequency: float | QickParam = sg.frequency * HZ_TO_MHZ if not isinstance(sg.frequency, QickParam) else sg.frequency
             qick.declare_gen(
                     ch=sg.ch,
-                    nqz=1 if sg.frequency * HZ_TO_MHZ < sampling_rate / 2 else 2
+                    nqz=1 if qick_frequency < sampling_rate / 2 else 2
                 )
             # envelopes and pulses
             pulse: Pulse
             for pulse in sg.pulses:
+                qick_duration: float | QickParam = pulse.duration * NS_TO_US if not isinstance(pulse.duration, QickParam) else pulse.duration
+                qick_relative_phase: float | QickParam = pulse.relative_phase * RAD_TO_DEG if not isinstance(pulse.relative_phase, QickParam) else pulse.relative_phase
+
                 if isinstance(pulse.envelope, Rectangular):
                     qick.add_pulse(
                         ch=sg.ch,
-                        freq=sg.frequency * HZ_TO_MHZ, 
+                        freq=qick_frequency, 
                         # ro_ch=ro_chs[0], 
                         name=pulse.id,
                         style="const", 
-                        length=pulse.duration * NS_TO_US,
-                        phase=pulse.relative_phase * RAD_TO_DEG,
-                        gain=pulse.amplitude, 
+                        length=qick_duration,
+                        phase=qick_relative_phase,
+                        gain=pulse.amplitude,
                     )
                 else:
-                    num_samples: int = int(pulse.duration*NS_TO_US*f_fabric)
+                    num_samples: int = int(qick_duration*f_fabric)
                     qick.add_envelope(
                         ch=sg.ch,
                         name=pulse.id,
@@ -158,12 +170,12 @@ class TIIqProgram(AveragerProgramV2):
                     )
                     qick.add_pulse(
                         ch=sg.ch,
-                        freq=sg.frequency * HZ_TO_MHZ, 
+                        freq=qick_frequency, 
                         # ro_ch=ro_ch,  
                         name=pulse.id, 
                         style="arb", 
                         envelope=pulse.id,
-                        phase=pulse.relative_phase,
+                        phase=qick_relative_phase,
                         gain=pulse.amplitude, 
                     )
 
@@ -180,28 +192,41 @@ class TIIqProgram(AveragerProgramV2):
             f_fabric: float = gencfg['f_fabric']
             interpolation: int = gencfg['interpolation']
             maxv: int = int(gencfg['maxv'] * gencfg['maxv_scale'])
+            
             nqz = 1 if sg.digital_mixer_frequency * HZ_TO_MHZ < sampling_rate / 2 else 2
             nqzs = [1 if freq * HZ_TO_MHZ < sampling_rate / 2 else 2 for freq in sg.get_mux_freqs(include_default=False)]
+
+            qick_frequencies: list[float | QickParam] = [
+                freq * HZ_TO_MHZ 
+                if not isinstance(freq, QickParam) else freq 
+                for freq in sg.get_mux_freqs()
+            ]
+            qick_phases: list[float | QickParam] = [
+                phase * RAD_TO_DEG
+                if not isinstance(phase, QickParam) else phase 
+                for phase in sg.get_mux_phases()
+            ]
             if len(set(nqzs)) != 1 or nqz != nqzs[0]:
                 raise ValueError("TODO")
             qick.declare_gen(
                     ch=sg.ch,
                     nqz=nqz,
                     ro_ch=sg.ro_ch,  
-                    mux_freqs=[freq * HZ_TO_MHZ for freq in sg.get_mux_freqs()],
+                    mux_freqs=qick_frequencies,
                     mux_gains=[gain for gain in sg.get_mux_gains()],
-                    mux_phases=[phase * RAD_TO_DEG for phase in sg.get_mux_phases()],
+                    mux_phases=qick_phases,
                     mixer_freq=sg.digital_mixer_frequency * HZ_TO_MHZ, 
                 )
 
             # envelopes and pulses
             pulse: ScheduledMultiplexedPulses
             for pulse in sg.pulses:
+                qick_duration: float | QickParam = pulse.duration * NS_TO_US if not isinstance(pulse.duration, QickParam) else pulse.duration
                 qick.add_pulse(
                     ch=sg.ch,
                     name=pulse.id,
                     style="const", 
-                    length=pulse.duration * NS_TO_US,
+                    length=qick_duration,
                     mask=sg.mask
                 )
             
@@ -212,13 +237,16 @@ class TIIqProgram(AveragerProgramV2):
         for sp in self.module_settings.acquisition_signal_processors.values():
             tone: MuxedSignalProcessorTone
             for tone in sp.tones.values():
+                qick_duration: float | QickParam = tone.duration * NS_TO_US if not isinstance(tone.duration, QickParam) else tone.duration
+                qick_frequency: float | QickParam = tone.frequency * HZ_TO_MHZ if not isinstance(tone.frequency, QickParam) else tone.frequency
+                qick_phase: float | QickParam = tone.phase * RAD_TO_DEG if not isinstance(tone.phase, QickParam) else tone.phase
                 cfg: dict = tone.cfg
                 qick.declare_readout(
                     ch=tone.ch,
-                    length=tone.duration * NS_TO_US,
-                    freq=tone.frequency * HZ_TO_MHZ,
+                    length=qick_duration,
+                    freq=qick_frequency,
                     sel='product',
-                    phase=tone.phase * RAD_TO_DEG,
+                    phase=qick_phase,
                     gen_ch=tone.dac,
                 )
 
@@ -252,21 +280,24 @@ class TIIqProgram(AveragerProgramV2):
         input: InputId = acquisition.input
         sp: MuxedSignalProcessor = self.module_settings.signal_processors[input]
         ro_chs: list[int] = [tone.ch for tone in sp.tones.values()]
-        qick.trigger(ros=ro_chs, t=READOUT_LAG * NS_TO_US)
+        qick.trigger(ros=ro_chs, t=READOUT_LAG * NS_TO_US) # TODO: add TOF (~350ns)
 
     def _initialize(self, cfg:dict):
         qick = self
+        self._initialize_sweepers()
         self._initialize_drive_signal_generators()
         self._initialize_flux_signal_generators()
         self._initialize_probe_signal_generators()
         self._initialize_acquisition_signal_processors()
-        self._initialize_sweepers()
+        # qick.sync()
 
     def _body(self, cfg:dict):
         qick = self
         start: float
         duration: float
         scheduled_item: ScheduledItem
+
+        qick.sync()
         for scheduled_item in self.scheduled_sequence:
             lag: float = scheduled_item.lag
             if lag != 0.0:
@@ -287,9 +318,8 @@ class TIIqProgram(AveragerProgramV2):
             elif isinstance(scheduled_item, ScheduledMultiplexedAcquisitions):
                 multiplexed_acquisition: ScheduledMultiplexedAcquisitions = scheduled_item
                 self._trigger_acquisition(multiplexed_acquisition)
-        if (self.sequence_total_duration - self.scheduled_sequence.duration) != 0: # TODO allow for approximate values
-            qick.delay_auto(t=(self.sequence_total_duration - self.scheduled_sequence.duration - 46) * NS_TO_US, gens=True, ros=True)
-            # TODO find out where this 45 comes from. 45 and 46 render the same results so I suspect is related to the 
-            # number ot tProc instructions. How can we estimate them. assmebly duration?
-            # That doesn't work!!
-            pass
+        last_item: ScheduledItem = scheduled_item
+        # if (self.sequence_total_duration - last_item.start) > 0:
+        #     qick.delay(t=(self.sequence_total_duration - last_item.start) * NS_TO_US)
+        qick.wait(t=0)
+        qick.delay(t=self.relaxation_time * NS_TO_US)

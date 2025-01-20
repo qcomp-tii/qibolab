@@ -44,23 +44,11 @@ class TIIqController(Controller):
     modules: dict[str, TIIqModule]
     bounds: str = "tiiq/bounds"
 
-    def _configure_trigger_source(self):
-        num_modules: int = len(self.modules)
-        if num_modules == 1:
-            trigger_source = 'internal'
-        else:
-            trigger_source = 'external'
-        module: TIIqModule
-        for module in self.modules.values():
-            module.settings.trigger_source = trigger_source
-
     def model_post_init(self, __context):
         self.channels: dict[ChannelId, Channel]  = {}
         # confirm modules are present
         if len(self.modules) == 0:
             raise ValueError('No modules found in TIIqController.')
-        # configure trigger source
-        self._configure_trigger_source()
         # register channels
         for module_id, module in self.modules.items():
             for channel_id, channel in module.channels.items():
