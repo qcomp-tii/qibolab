@@ -40,16 +40,16 @@ FLUX_LAG: float = 20 # ns  # TODO Agustin to measure
 
 
 class TIIqProgram(AveragerProgramV2):
-    module_settings: TIIqSettings| None = None
     firmware_configuration: QickConfig
+    module_settings: TIIqSettings| None = None
     scheduled_sequence: ScheduledPulseSequence
     sequence_total_duration: float
     relaxation_time: float
 
     
     def __init__(self, *args, **kwargs):
-        self.module_settings = kwargs.pop("module_settings")
         self.firmware_configuration = kwargs.pop("firmware_configuration")
+        self.module_settings = kwargs.pop("module_settings")
         self.scheduled_sequence = kwargs.pop("scheduled_sequence")
         self.sequence_total_duration = kwargs.pop("sequence_total_duration")
         self.relaxation_time = kwargs.pop("relaxation_time")
@@ -62,12 +62,17 @@ class TIIqProgram(AveragerProgramV2):
         kwargs["soccfg"] = self.firmware_configuration
         super().__init__(*args, **kwargs)
 
+
+    def _initialize_sweepers(self):
+        for name, nsteps in self.module_settings.rt_sweepers:
+            self.add_loop(name, nsteps)
+
     def _initialize_drive_signal_generators(self):
         qick = self
         # drive
         # declare signal generators (axis_sg_int4_v2)
         sg: InterpolatedSignalGenerator
-        for sg in self.module_settings.drive_signal_generators.values():
+        for output, sg in self.module_settings.drive_signal_generators.items():
             cfg: dict = sg.cfg
             f_dds: float = cfg['f_dds']
             sampling_rate: float = cfg['fs']
@@ -84,7 +89,7 @@ class TIIqProgram(AveragerProgramV2):
 
             # envelopes and pulses
             pulse: Pulse
-            for pulse in sg.pulses:
+            for pulse in self.module_settings.signal_generators_pulses[output]:
                 qick_duration: float | QickParam = pulse.duration * NS_TO_US if not isinstance(pulse.duration, QickParam) else pulse.duration
                 qick_relative_phase: float | QickParam = pulse.relative_phase * RAD_TO_DEG if not isinstance(pulse.relative_phase, QickParam) else pulse.relative_phase
 
@@ -130,7 +135,7 @@ class TIIqProgram(AveragerProgramV2):
         # flux
         # declare signal generators (axis_signal_gen_v6)
         sg: FullSpeedSignalGenerator
-        for sg in self.module_settings.flux_signal_generators.values():
+        for output, sg in self.module_settings.flux_signal_generators.items():
             gencfg: dict = self.firmware_configuration['gens'][sg.ch]
             f_dds: float = gencfg['f_dds']
             sampling_rate: float = gencfg['fs']
@@ -145,7 +150,7 @@ class TIIqProgram(AveragerProgramV2):
                 )
             # envelopes and pulses
             pulse: Pulse
-            for pulse in sg.pulses:
+            for pulse in self.module_settings.signal_generators_pulses[output]:
                 qick_duration: float | QickParam = pulse.duration * NS_TO_US if not isinstance(pulse.duration, QickParam) else pulse.duration
                 qick_relative_phase: float | QickParam = pulse.relative_phase * RAD_TO_DEG if not isinstance(pulse.relative_phase, QickParam) else pulse.relative_phase
 
@@ -220,7 +225,7 @@ class TIIqProgram(AveragerProgramV2):
 
             # envelopes and pulses
             pulse: ScheduledMultiplexedPulses
-            for pulse in sg.pulses:
+            for pulse in self.module_settings.signal_generators_pulses[output]:
                 qick_duration: float | QickParam = pulse.duration * NS_TO_US if not isinstance(pulse.duration, QickParam) else pulse.duration
                 qick.add_pulse(
                     ch=sg.ch,
@@ -250,27 +255,27 @@ class TIIqProgram(AveragerProgramV2):
                     gen_ch=tone.dac,
                 )
 
-    def _initialize_sweepers(self):
-        for name, nsteps in self.module_settings.rt_sweepers:
-            self.add_loop(name, nsteps)
 
-    def _play_drive_pulse(self, channel_id: ChannelId, pulse: Pulse):
+    def _play_drive_pulse(self, pulse: ScheduledPulse):
         qick = self
         # axis_sg_int4_v2
+        output: OutputId = pulse.output
         sg: InterpolatedSignalGenerator
-        sg = self.module_settings.drive_signal_generators[channel_id]
+        sg = self.module_settings.drive_signal_generators[output]
         qick.pulse(ch=sg.ch, name=pulse.id, t=0)
 
-    def _play_flux_pulse(self, channel_id: ChannelId, pulse: Pulse):
+    def _play_flux_pulse(self, pulse: ScheduledPulse):
         qick = self
         # axis_signal_gen_v6
+        output: OutputId = pulse.output
         sg: FullSpeedSignalGenerator
-        sg = self.module_settings.flux_signal_generators[channel_id]
+        sg = self.module_settings.flux_signal_generators[output]
         qick.pulse(ch=sg.ch, name=pulse.id, t=FLUX_LAG * NS_TO_US)
 
-    def _play_probe_pulses(self, output: OutputId, pulse: Pulse):
+    def _play_probe_pulses(self, pulse: ScheduledMultiplexedPulses):
         qick = self
         # axis_sg_mixmux8_v1
+        output: OutputId = pulse.output
         sg: MuxedSignalGenerator
         sg = self.module_settings.probe_signal_generators[output]
         qick.pulse(ch=sg.ch, name=pulse.id, t=READOUT_LAG * NS_TO_US)
@@ -281,6 +286,7 @@ class TIIqProgram(AveragerProgramV2):
         sp: MuxedSignalProcessor = self.module_settings.signal_processors[input]
         ro_chs: list[int] = [tone.ch for tone in sp.tones.values()]
         qick.trigger(ros=ro_chs, t=READOUT_LAG * NS_TO_US) # TODO: add TOF (~350ns)
+
 
     def _initialize(self, cfg:dict):
         qick = self
@@ -306,15 +312,14 @@ class TIIqProgram(AveragerProgramV2):
                 pulse: ScheduledPulse = scheduled_item
                 channel_id: ChannelId = scheduled_item.channel_id
                 if "drive" in channel_id:
-                    self._play_drive_pulse(channel_id, pulse)
+                    self._play_drive_pulse(pulse)
                 elif "flux" in channel_id:
-                    self._play_flux_pulse(channel_id, pulse)
+                    self._play_flux_pulse(pulse)
                 else:
                     raise ValueError("TODO")
             elif isinstance(scheduled_item, ScheduledMultiplexedPulses):
                 pulse: ScheduledMultiplexedPulses = scheduled_item
-                output: OutputId = pulse.output
-                self._play_probe_pulses(output, pulse)
+                self._play_probe_pulses(pulse)
             elif isinstance(scheduled_item, ScheduledMultiplexedAcquisitions):
                 multiplexed_acquisition: ScheduledMultiplexedAcquisitions = scheduled_item
                 self._trigger_acquisition(multiplexed_acquisition)

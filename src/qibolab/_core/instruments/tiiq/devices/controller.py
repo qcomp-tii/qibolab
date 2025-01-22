@@ -139,7 +139,6 @@ class TIIqController(Controller):
             threads: dict[str, threading.Thread] = {}
             # Create and start threads
             for module_id, module in self.modules.items():
-    
                     def thread_target(mod=module):
                         log.debug(f"Starting thread for module {module_id}.")
                         module_results[module_id] = mod.execute()

@@ -24,10 +24,12 @@ __all__ = [
 
 class Mutable():
     id: PulseId
+    channel_id: ChannelId
     _original: PulseLike
     attr_names: list[str] = ['id']
 
-    def __init__(self, pulse_like: PulseLike):
+    def __init__(self, channel_id: ChannelId, pulse_like: PulseLike):
+        self.channel_id = channel_id
         self._original = pulse_like
 
     def __getattr__(self, name):
@@ -43,40 +45,147 @@ class Mutable():
         attrs = ", ".join(f"{name}={getattr(self, name, None)!r}" for name in self.attr_names)
         return f"{self.__class__.__name__}({attrs})"
 
+
+class MutablePulse(Mutable):
+    def __init__(self, channel_id: ChannelId, pulse_like: PulseLike):
+        assert isinstance(pulse_like, Pulse)
+        super().__init__(channel_id, pulse_like)
+        self.attr_names = ['channel_id', 'duration', 'amplitude', 'envelope', 'relative_phase', 'id']
+
+
+class MutableAcquisition(Mutable):
+    def __init__(self, channel_id: ChannelId, pulse_like: PulseLike):
+        assert isinstance(pulse_like, Acquisition)
+        super().__init__(channel_id, pulse_like)
+        self.attr_names = ['channel_id', 'duration', 'id']
+
+
+class MutableReadout(Mutable):
+    def __init__(self, channel_id: ChannelId, pulse_like: PulseLike):
+        assert isinstance(pulse_like, Readout)
+        super().__init__(channel_id, pulse_like)
+        self.attr_names = ['channel_id', 'duration', 'amplitude', 'envelope', 'relative_phase', 'id']
+
+
+class MutableDelay(Mutable):
+    def __init__(self, channel_id: ChannelId, pulse_like: PulseLike):
+        assert isinstance(pulse_like, Delay)
+        super().__init__(channel_id, pulse_like)
+        self.attr_names = ['channel_id', 'duration', 'id']
+
+
+class MutableVirtualZ(Mutable):
+    def __init__(self, channel_id: ChannelId, pulse_like: PulseLike):
+        assert isinstance(pulse_like, VirtualZ)
+        super().__init__(channel_id, pulse_like)
+        self.attr_names = ['channel_id', 'phase', 'id']
+
+
+MutableItem = Union[MutablePulse, MutableAcquisition, MutableReadout, MutableDelay, MutableVirtualZ]
+
+
+class MutablePulseSequence():
+    _data: list[MutableItem]
+    _id_map: dict[PulseId, MutableItem]
+
+    @property
+    def channels(self) -> set[ChannelId]:
+        """Channels involved in the sequence."""
+        _channels = set()
+        for item in self._data:
+            if not isinstance(item, MutableItem):
+                raise TypeError(f"Item {item} is not an instance of MutableItem type.")
+            else:
+                _channels |= {item.channel_id}
+        return _channels
+
+    def __init__(self):
+        self._data: list[MutableItem] = []
+        self._id_map: dict[PulseId, MutableItem] = {}
+
+
+    def add_item(self, item: MutableItem):
+        """
+        Add a mutable item to the mutable pulse sequence.
+        """
+        if not isinstance(item, (MutableItem)):
+            raise TypeError(f"Item {item} is not an instance of MutableItem type.")
+        
+        if isinstance(item, MutableItem):
+            self._data.append(item)
+            self._id_map[item.id] = item
+
+
+    def get_item(self, item_id: PulseId) -> MutableItem | None:
+        """
+        Retrieve an item by its ID.
+
+        :param item_id: The unique ID of the item to retrieve.
+        :return: The corresponding MutableItem if found, None otherwise.
+        """
+        return self._id_map.get(item_id)
+
+    def remove_item(self, item: MutableItem):
+        self._data.remove(self._id_map.pop(item.id))
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __getitem__(self, index: int) -> MutableItem:
+        """Get an item by index."""
+        return self._data[index]
+
+    def __len__(self) -> int:
+        """Return the length of the scheduled pulse sequence."""
+        return len(self._data)
+
+    def __repr__(self) -> str:
+        """Return a string representation of the scheduled pulse sequence."""
+        attr_names = ['channels']
+        attrs = ", ".join(f"{name}={getattr(self, name, None)!r}" for name in attr_names)
+
+        items = "\n\t".join(repr(item) for item in self._data)
+        return f"{self.__class__.__name__}({attrs})\n\t{items}"
+
+
 class Scheduled(Mutable):
-    channel_id: ChannelId
     start: float
     lag: float|None
     duration: float
 
-    def __init__(self, channel_id: ChannelId, start:float, pulse_like: PulseLike):
-        super().__init__(pulse_like)
+    def __init__(self, channel_id: ChannelId, start:float, item: MutableItem):
+        pulse_like: PulseLike = item._original
+        super().__init__(channel_id, pulse_like)
+        for k, v in item.__dict__.items():
+            setattr(self, k, v)
         self.attr_names += ['channel_id', 'start', 'lag', 'duration']
-        self.channel_id = channel_id
         self.start = start
         self.lag = None
+
 
 class ScheduledPulse(Scheduled):
     output: OutputId
     is_multiplexed: bool
 
-    def __init__(self, channel_id: ChannelId, start:float, pulse_like: PulseLike):
-        assert isinstance(pulse_like, Pulse)
-        super().__init__(channel_id, start, pulse_like)
-        self.attr_names = ['channel_id', 'start', 'lag', 'id', 'duration', 'amplitude', 'envelope', 'relative_phase', 'output', 'is_multiplexed']
+    def __init__(self, channel_id: ChannelId, start:float, item: MutableItem):
+        assert isinstance(item._original, Pulse)
+        super().__init__(channel_id, start, item)
+        self.attr_names = ['channel_id', 'start', 'lag', 'duration', 'amplitude', 'envelope', 'relative_phase', 'output', 'is_multiplexed', 'id']
         self.output = None
         self.is_multiplexed = False
+
 
 class ScheduledAcquisition(Scheduled):
     input: InputId
     is_multiplexed: bool
 
-    def __init__(self, channel_id: ChannelId, start:float, pulse_like: PulseLike):
-        assert isinstance(pulse_like, Acquisition)
-        super().__init__(channel_id, start, pulse_like)
-        self.attr_names = ['channel_id', 'start', 'lag', 'id', 'duration', 'input', 'is_multiplexed']
+    def __init__(self, channel_id: ChannelId, start:float, item: MutableItem):
+        assert isinstance(item._original, Acquisition)
+        super().__init__(channel_id, start, item)
+        self.attr_names = ['channel_id', 'start', 'lag', 'duration', 'input', 'is_multiplexed', 'id']
         self.input = None
         self.is_multiplexed = False
+
 
 class ScheduledReadout(Scheduled):
     output: InputId
@@ -85,22 +194,30 @@ class ScheduledReadout(Scheduled):
     probe: Pulse
     acquisition: Acquisition
 
-    def __init__(self, channel_id: ChannelId, start:float, pulse_like: PulseLike):
-        assert isinstance(pulse_like, Readout)
-        super().__init__(channel_id, start, pulse_like)
-        self.attr_names = ['channel_id', 'start', 'lag', 'id', 'duration', 'amplitude', 'envelope', 'relative_phase', 'ouput', 'input', 'is_multiplexed']
+    def __init__(self, channel_id: ChannelId, start:float, item: MutableItem):
+        assert isinstance(item._original, Readout)
+        super().__init__(channel_id, start, item)
+        self.attr_names = ['channel_id', 'start', 'lag', 'duration', 'amplitude', 'envelope', 'relative_phase', 'ouput', 'input', 'is_multiplexed', 'id']
         self.output = None
         self.input = None
         self.is_multiplexed = False
 
+
 class ScheduledDelay(Scheduled):
-    def __init__(self, channel_id: ChannelId, start:float, pulse_like: PulseLike):
-        assert isinstance(pulse_like, Delay)
-        super().__init__(channel_id, start, pulse_like)
-        self.attr_names = ['channel_id', 'start', 'lag', 'id', 'duration']
+    def __init__(self, channel_id: ChannelId, start:float, item: MutableItem):
+        assert isinstance(item._original, Delay)
+        super().__init__(channel_id, start, item)
+        self.attr_names = ['channel_id', 'start', 'lag', 'duration', 'id']
 
 
-ScheduledItem = Union[ScheduledPulse, ScheduledAcquisition, ScheduledReadout, ScheduledDelay]
+class ScheduledVirtualZ(Scheduled):
+    def __init__(self, channel_id: ChannelId, start:float, item: MutableItem):
+        assert isinstance(item._original, VirtualZ)
+        super().__init__(channel_id, start, item)
+        self.attr_names = ['channel_id', 'start', 'lag', 'duration', 'id']
+
+
+ScheduledItem = Union[ScheduledPulse, ScheduledAcquisition, ScheduledReadout, ScheduledDelay, ScheduledVirtualZ]
 
 
 @dataclass
@@ -138,7 +255,7 @@ class ScheduledMultiplexedAcquisitions():
     
     def __repr__(self) -> str:
         """Return a string representation of the scheduled multiplexed acquisitions."""
-        attr_names = ['channel_ids', 'start', 'lag', 'id', 'duration', 'input']
+        attr_names = ['channel_ids', 'start', 'lag', 'duration', 'input', 'id']
         attrs = ", ".join(f"{name}={getattr(self, name, None)!r}" for name in attr_names)
 
         items = "\n\t\t".join(repr(item) for item in self.acquisitions)
@@ -189,7 +306,7 @@ class ScheduledMultiplexedPulses():
         
     def __repr__(self) -> str:
         """Return a string representation of the scheduled multiplexed pulses."""
-        attr_names = ['channel_ids', 'start', 'lag', 'id', 'duration', 'output']
+        attr_names = ['channel_ids', 'start', 'lag', 'duration', 'output', 'id']
         attrs = ", ".join(f"{name}={getattr(self, name, None)!r}" for name in attr_names)
 
         items = "\n\t\t".join(repr(item) for item in self.pulses)
@@ -217,7 +334,7 @@ class ScheduledPulseSequence():
         """Channels involved in the sequence."""
         _channels = set()
         for item in self._data:
-            if isinstance(item, (ScheduledPulse, ScheduledAcquisition)):
+            if isinstance(item, (ScheduledPulse, ScheduledAcquisition, ScheduledReadout)):
                 _channels |= {item.channel_id}
             elif isinstance(item, (ScheduledMultiplexedAcquisitions, ScheduledMultiplexedPulses)):
                 _channels |= set(item.channel_ids)

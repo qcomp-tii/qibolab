@@ -1,6 +1,7 @@
 import pathlib
 from dataclasses import dataclass, field, asdict
 from Pyro4 import Proxy
+from typing import Optional, Literal
 
 from qibo.config import log
 from qibolab._core.components import (
@@ -24,6 +25,7 @@ from qibolab._core.instruments.tiiq.common import (
     InputId,
     modes,
     SIMULATION,
+    DEBUG,
     get_rf_output_from_port_id,
     get_dc_output_from_port_id,
     get_rf_input_from_port_id,
@@ -39,14 +41,26 @@ from qibolab._core.instruments.tiiq.devices.settings import (
     MuxedSignalProcessor,
     MuxedSignalProcessorTone,
     BiassingChannel,
+    SignalGeneratorsType,
+    SignalProcessorsType,
+    BiassingChannelsType,
 )
 from qibolab._core.instruments.tiiq.programs.program import TIIqProgram 
 from qibolab._core.instruments.tiiq.scheduled import (
+    Mutable,
+    MutablePulse,
+    MutableAcquisition,
+    MutableReadout,
+    MutableDelay,
+    MutableVirtualZ,
+    MutablePulseSequence, 
+    MutableItem,
     Scheduled,
     ScheduledPulse,
     ScheduledAcquisition,
     ScheduledReadout,
     ScheduledDelay,
+    ScheduledVirtualZ,
     ScheduledMultiplexedPulses,
     ScheduledMultiplexedAcquisitions,
     ScheduledPulseSequence
@@ -77,17 +91,22 @@ class TIIqModule:
     # static
     address: str
     channels: dict[ChannelId, Channel]
-    soc: Proxy|None = field(init=False, repr=False)
-    firmware_configuration: QickConfig = field(init=False, repr=False)
-    tidac: Proxy|None = field(init=False, repr=False) # TIDAC80508
-    libgpio_control: Proxy|None|None = field(init=False, repr=False) # libgpio_control
 
-    # generated for every execution
-    settings: TIIqSettings = field(init=False, repr=False)
-    configs: dict[str, Config] = field(init=False, repr=False)
-    active_channels: dict[ChannelId, Channel]|None = field(init=False, repr=False)
-    program: TIIqProgram|None = field(init=False, repr=False)
-    scheduled_sequence: ScheduledPulseSequence|None = field(init=False, repr=False)
+    soc: Proxy|None = field(init=False, repr=False)
+    firmware_configuration: QickConfig|None = field(init=False, repr=False)
+    tidac: Proxy|None = field(init=False, repr=False) # TIDAC80508
+    libgpio_control: Proxy|None = field(init=False, repr=False) # libgpio_control
+
+    outputs: list[str]|None = field(init=False, repr=False)
+    inputs: list[str]|None = field(init=False, repr=False)
+    signal_generators: dict[OutputId, SignalGeneratorsType] = field(init=False, repr=False)
+    signal_processors: dict[InputId, SignalProcessorsType] = field(init=False, repr=False)
+    channel_id_to_output_map: dict[ChannelId, OutputId] = field(init=False, repr=False)
+    channel_id_to_input_map: dict[ChannelId, InputId] = field(init=False, repr=False)
+    trigger_source: Optional[Literal['internal']|Literal['external']] = 'internal'
+
+    acquisition_to_probe_map: dict[ChannelId, ChannelId] = field(init=False, repr=False)
+
 
     def _validate_channels(self, channels: dict[ChannelId, Channel]):
         assert isinstance(channels, dict)
@@ -117,11 +136,23 @@ class TIIqModule:
         self.tidac = None
         self.libgpio_control = None
 
-        self.settings = TIIqSettings()
+        self.inputs = None
+        self.outputs = None
+        self.signal_generators = {}
+        self.signal_processors = {}
+        self.channel_id_to_output_map = {}
+        self.channel_id_to_input_map = {}
+
+        self.acquisition_to_probe_map = {}
+
+        self.settings = None
         self.configs = None
+        self.options = None
         self.active_channels = None
         self.program = None
         self.scheduled_sequence = None
+        self.fl_sweepers = None
+        self.rt_sweepers = None
         self._validate_channels(self.channels)
 
     def _load_cached_firmware_configuration(self) -> QickConfig:
@@ -180,22 +211,16 @@ class TIIqModule:
             modes.enable(SIMULATION)
             self.firmware_configuration = self._load_cached_firmware_configuration()
 
-    def _reset_bias(self):
-        tidac: Proxy = self.tidac
-
-        for ch in range(TIDAC_NCHANNELS):
-            tidac.set_bias(ch, bias_value=0)
-
-    def _parse_firmware_configuration(self, firmware_configuration: QickConfig, settings: TIIqSettings):
+    def _parse_firmware_configuration(self, firmware_configuration: QickConfig):
         # identify inputs and outputs
-        settings.outputs = list(firmware_configuration._cfg['dacs'])
-        settings.inputs = list(firmware_configuration._cfg['adcs'])
+        self.outputs = list(firmware_configuration._cfg['dacs'])
+        self.inputs = list(firmware_configuration._cfg['adcs'])
 
         # create signal generators and processors
         for ch, cfg in enumerate(firmware_configuration._cfg['gens']):
             if cfg['type'] == 'axis_sg_int4_v2':
                 output = cfg['dac']
-                settings.signal_generators[output] = (
+                self.signal_generators[output] = (
                         InterpolatedSignalGenerator(
                         ch=ch,
                         cfg=cfg,
@@ -204,7 +229,7 @@ class TIIqModule:
         
             elif cfg['type'] == 'axis_signal_gen_v6':
                 output = cfg['dac']
-                settings.signal_generators[output] = (
+                self.signal_generators[output] = (
                         FullSpeedSignalGenerator(
                         ch=ch,
                         cfg=cfg,
@@ -212,7 +237,7 @@ class TIIqModule:
                 )
             elif cfg['type'] == 'axis_sg_mixmux8_v1':
                 output = cfg['dac']
-                settings.signal_generators[output] = (
+                self.signal_generators[output] = (
                         MuxedSignalGenerator(
                         ch=ch,
                         cfg=cfg,
@@ -223,69 +248,39 @@ class TIIqModule:
 
         inputs: list[InputId] = set([cfg['adc'] for cfg in firmware_configuration._cfg['readouts']])
         for input in inputs:
-            settings.signal_processors[input] = MuxedSignalProcessor()
+            self.signal_processors[input] = MuxedSignalProcessor()
 
         for ch, cfg in enumerate(firmware_configuration._cfg['readouts']):
             if cfg['ro_type'] == 'axis_pfb_readout_v4':
                 input: InputId = cfg['adc']
-                mux_signal_processor: MuxedSignalProcessor = settings.signal_processors[input]
+                mux_signal_processor: MuxedSignalProcessor = self.signal_processors[input]
                 mux_signal_processor.tone_processors[ch].ch = ch
                 mux_signal_processor.tone_processors[ch].cfg = cfg
             else:
                 log.warning(f"Signal processor type {cfg['ro_type']} is not supported.")
 
-    def _map_channels_to_outputs_inputs(self, channels: dict[ChannelId, Channel], settings: TIIqSettings):
+    def _map_channels_to_outputs_inputs(self, channels: dict[ChannelId, Channel]):
         for channel_id in channels:
             channel: Channel = channels[channel_id]
             port_id: PortId = channel.path
             if isinstance(channel, AcquisitionChannel):
                 input: InputId = get_rf_input_from_port_id(port_id)
-                settings.channel_id_to_input_map[channel_id] = input
+                self.channel_id_to_input_map[channel_id] = input
             else:
                 output: OutputId = get_rf_output_from_port_id(port_id, require_valid=False)
-                settings.channel_id_to_output_map[channel_id] = output
+                self.channel_id_to_output_map[channel_id] = output
+
+    def _reset_bias(self):
+        tidac: Proxy = self.tidac
+
+        for ch in range(TIDAC_NCHANNELS):
+            tidac.set_bias(ch, bias_value=0)
 
     def _initialize_peripherals(self):
-        # # TODO move this to board code (the one that starts the pyro server)
+        if not modes.is_enabled(SIMULATION):
+            self._reset_bias()
         # # TODO expose gain so that SetDACVOP can be adjusted, instead of hardcoding 40000
-        # import sys
-        # sys.path.append('/home/xilinx/jupyter_notebooks/qick/qick_demos/custom/drivers')
 
-        # from TIDAC80508 import TIDAC80508
-        # tidac = TIDAC80508()
-
-        # ### SET POWER FOR DACs ###
-        # dac_2280 = soc.usp_rf_data_converter_0.dac_tiles[0].blocks[0]
-        # dac_2280.SetDACVOP(40000)
-        # dac_2281 = soc.usp_rf_data_converter_0.dac_tiles[0].blocks[1]
-        # dac_2281.SetDACVOP(40000)
-        # dac_2282 = soc.usp_rf_data_converter_0.dac_tiles[0].blocks[2]
-        # dac_2282.SetDACVOP(40000)
-        # dac_2283 = soc.usp_rf_data_converter_0.dac_tiles[0].blocks[3]
-        # dac_2283.SetDACVOP(40000)
-        # dac_2290 = soc.usp_rf_data_converter_0.dac_tiles[1].blocks[0]
-        # dac_2290.SetDACVOP(40000)
-
-        # dac_2292 = soc.usp_rf_data_converter_0.dac_tiles[1].blocks[2]
-        # dac_2292.SetDACVOP(40000)
-
-        # dac_2230 = soc.usp_rf_data_converter_0.dac_tiles[2].blocks[0]
-        # dac_2230.SetDACVOP(40000)
-        # dac_2231 = soc.usp_rf_data_converter_0.dac_tiles[2].blocks[1]
-        # dac_2231.SetDACVOP(40000)
-        # dac_2232 = soc.usp_rf_data_converter_0.dac_tiles[2].blocks[2]
-        # dac_2232.SetDACVOP(40000)        
-
-        # ### ENABLE MULTI TILE SYNCHRONIZATION ###
-        # soc.usp_rf_data_converter_0.mts_dac_config.RefTile = 2
-        # soc.usp_rf_data_converter_0.mts_dac_config.Tiles = 0b0011
-        # soc.usp_rf_data_converter_0.mts_dac_config.SysRef_Enable = 1
-        # soc.usp_rf_data_converter_0.mts_dac_config.Target_Latency = -1
-        # soc.usp_rf_data_converter_0.mts_dac()
-
-        
-        pass
-            
     def connect(self):
         """Establish connection with the module."""
         log.info(f"Connecting to TIIqModule at IP {self.address}.")
@@ -295,13 +290,8 @@ class TIIqModule:
         else:
             self._connect_to_pyro_server()
 
-        self.settings.firmware_configuration = self.firmware_configuration 
-        # TODO: firmware_configuration may not be needed in settings
-        
-        if not modes.is_enabled(SIMULATION):
-            self._reset_bias()
-        self._parse_firmware_configuration(self.firmware_configuration, self.settings)
-        self._map_channels_to_outputs_inputs(self.channels, self.settings)
+        self._parse_firmware_configuration(self.firmware_configuration)
+        self._map_channels_to_outputs_inputs(self.channels)
         self._initialize_peripherals()
 
     def disconnect(self):
@@ -309,99 +299,159 @@ class TIIqModule:
         log.info(f"Disconnecting from TIIqModule at IP {self.address}.")
         # TODO: disconnect from proxy
 
-    def _syncronize(self, sequence: PulseSequence):
-        # TODO: fuse delays
+
+    # generated for every execution
+    # settings: TIIqSettings = field(init=False, repr=False)
+    # configs: dict[str, Config] = field(init=False, repr=False)
+    # options: ExecutionParameters = field(init=False, repr=False)
+    # active_channels: dict[ChannelId, Channel]|None = field(init=False, repr=False)
+    # program: TIIqProgram|None = field(init=False, repr=False)
+    # scheduled_sequence: ScheduledPulseSequence|None = field(init=False, repr=False)
+    # fl_sweepers: list[ParallelSweepers]|None = field(init=False, repr=False)
+    # rt_sweepers: list[ParallelSweepers]|None = field(init=False, repr=False)
+    # programs: list[TIIqProgram]|None = field(init=False, repr=False)
+
+    def _is_rt_sweeper(self, sweeper: Sweeper) -> bool:
+        is_rt_sweeper: bool = False
+        if sweeper.parameter == Parameter.frequency:
+            supported = []
+            if all(channel in supported for channel in sweeper.channels):
+                is_rt_sweeper = True
+            # drive pulses -> True
+            # flux pulses -> True
+            # standalone probe pulses -> True
+            # multiplexed probe pulses -> False
+            # standalone acquisition -> True
+            # multiplexed acquisition -> False
+        elif sweeper.parameter == Parameter.amplitude:
+            # TODO Qibolab issue, sweeper pulse does not contain information about the channel
+            # to get it I have to check in the PulseSequence.pulse_channels()
+            # or else I have to create my own Sweeper object and pass that info...
+            is_rt_sweeper = False
+            # if all(pulse.channel in supported for pulse in sweeper.pulses):
+            #     is_rt_sweeper = True
+            # drive pulses -> True
+            # flux pulses -> True
+            # standalone probe pulses -> True
+            # multiplexed probe pulses -> False
+        elif sweeper.parameter == Parameter.duration:
+            is_rt_sweeper = False
+        elif sweeper.parameter == Parameter.duration_interpolated:
+            is_rt_sweeper = False
+        elif sweeper.parameter == Parameter.relative_phase:
+            is_rt_sweeper = True
+        elif sweeper.parameter == Parameter.offset:
+            supported = []
+            if all(channel in supported for channel in sweeper.channels):
+                is_rt_sweeper = True
+            # drive pulses -> True
+            # flux pulses -> True
+            # standalone probe pulses -> True
+            # multiplexed probe pulses -> False
+            # standalone acquisition -> True
+            # multiplexed acquisition -> False
+        
+        return is_rt_sweeper
+
+    def _separate_fl_and_rt_sweepers(self, sweepers: list[ParallelSweepers]) -> tuple[list[ParallelSweepers], list[ParallelSweepers]]:
+        fl_sweepers: list[ParallelSweepers] = []
+        rt_sweepers: list[ParallelSweepers] = []
+        for parallel_sweeper_set in sweepers:
+            if all(self._is_rt_sweeper(sweeper) for sweeper in parallel_sweeper_set):
+                rt_sweepers.append(parallel_sweeper_set)
+            else:
+                fl_sweepers.append(parallel_sweeper_set)
+        # TODO check all sweeps in the set have the same number of steps
+        # TODO: provide a map from the order of sweepers to the new order of fl_sweepers concatenated with rt_sweepers
+        # so that we can reshape the data
+        return fl_sweepers, rt_sweepers
+
+    #####################################################################################
+
+    def _create_sequence_copy(self, sequence: PulseSequence) -> PulseSequence:
+        """Create a copy of the sequence."""
+        new_sequence = PulseSequence()
+        for channel_id, pulse_like in sequence:
+            new_sequence.append((channel_id, pulse_like))
+        return new_sequence
+
+    def _replace_aligns_with_delays(self, sequence: PulseSequence) -> PulseSequence:
+        """Replace Align instructions with Delays."""
+        new_sequence: PulseSequence = sequence.align_to_delays()
+        return new_sequence
+
+    def _equalize_channel_durations(self, sequence: PulseSequence) -> PulseSequence:
+        """Equalize the durations of all channels in the sequence by adding delays."""	
+        # TODO: make a new sequence instead of modifying the original one
+        # TODO: fuse consecutive delays
+
         durations = {ch: sequence.channel_duration(ch) for ch in sequence.channels}
         max_duration = max(durations.values(), default=0.0)
         for ch, duration in durations.items():
             delay = max_duration - duration
             if delay > 0:
                 sequence.append((ch, Delay(duration=delay)))
+        return sequence
 
-    def _map_acquisitions_to_probes(self, configs: dict[str, Config], channels: dict[ChannelId, Channel], settings: TIIqSettings):
-        for channel_id in channels:
-            config: Config = configs[channel_id]
-            channel: Channel = channels[channel_id]
-
-            if isinstance(config, TIIqAcquisitionConfig) and isinstance(channel, AcquisitionChannel):
-                probe_channel_id: ChannelId|None = channel.probe
-                if probe_channel_id is not None:
-                    settings.acquisition_to_probe_map[channel_id] = probe_channel_id
-            # elif isinstance(config, TIIqProbeConfig) and isinstance(channel, ProbeChannel):
-            #         acquisition_channel_id: ChannelId|None = channel.acquisition
-            #         settings.acquisition_to_probe_map[acquisition_channel_id] = channel_id
-
-    def _generate_scheduled_sequence(self, sequence: PulseSequence) -> ScheduledPulseSequence:
-        channels: dict[ChannelId, Channel] = sequence.channels
-        time_at_channel: dict[ChannelId, float] = {}
-        for channel_id in channels:
-            time_at_channel[channel_id] = 0.0
-        scheduled_sequence: ScheduledPulseSequence = ScheduledPulseSequence()
-        scheduled_class_map={
-            Pulse: ScheduledPulse,
-            Acquisition: ScheduledAcquisition,
-            Readout: ScheduledReadout,
-            Delay: ScheduledDelay,
+    def _generate_mutable_sequence(self, sequence: PulseSequence) -> PulseSequence:
+        mutable_sequence: MutablePulseSequence = MutablePulseSequence()
+        mutable_class_map={
+            Pulse: MutablePulse,
+            Acquisition: MutableAcquisition,
+            Readout: MutableReadout,
+            Delay: MutableDelay,
+            VirtualZ: MutableVirtualZ,
         }
 
         for channel_id, pulse_like in sequence:
-            start: float = time_at_channel[channel_id]
             if isinstance(pulse_like, Align):
                 raise ValueError
-            elif isinstance(pulse_like, VirtualZ):
-                raise NotImplementedError
-            # elif isinstance(pulse_like, Delay):
-            #     duration: float = pulse_like.duration
             else:
                 item_class = type(pulse_like)
-                scheduled_class = scheduled_class_map[item_class]
-                scheduled_item: Scheduled = scheduled_class(channel_id, start, pulse_like)
-                duration: float = float(scheduled_item.duration)
-                scheduled_sequence.add_item(scheduled_item)
-            time_at_channel[channel_id] += duration
-        return scheduled_sequence
+                mutable_class = mutable_class_map[item_class]
+                mutable_item: Mutable = mutable_class(channel_id, pulse_like)
+                mutable_sequence.add_item(mutable_item)
+        return mutable_sequence
 
-    def _process_sweepers(self, scheduled_sequence: ScheduledPulseSequence, sweepers: list[ParallelSweepers], settings: TIIqSettings):
-        # outputs
-        # self.settings.rt_sweepers: list[tuple[str, int]]
-        # TODO
+    #####################################################################################
 
+    def _process_rt_sweepers(self, sequence: MutablePulseSequence, rt_sweepers: list[ParallelSweepers], settings: TIIqSettings) -> MutablePulseSequence:
+        # modifies sequence and settings in place
+        
         def scheduled(items):
             for item in items:
-                yield scheduled_sequence.get_item(item.id)
+                yield sequence.get_item(item.id)
         
-        for parallel_sweeper_set in sweepers:
-            # self.validate_sweeper(sweeper)
+        for parallel_sweeper_set in rt_sweepers:
             qnsteps = len(parallel_sweeper_set[0].values)
             name = f"Sweeper({parallel_sweeper_set[0].parameter}, {qnsteps})"
-            # TODO depending on type add to rt or fl sweepers
-            settings.rt_sweepers.append((name, qnsteps))
-            # self.program.add_loop(name, qnsteps)
+
             from qick.asm_v2 import QickSweep1D
             import numpy as np
-            # TODO check all can be done in real time
-
-            # TODO check if the item is reaout, then change its probe and acquisition
             for sweeper in parallel_sweeper_set:
-                values = sweeper.values # np.arange(start, stop, step)
-                qstart = values[0]
-                qstop = values[-1]
+                values = sweeper.values # np.linspace(start, stop, nsteps)
+                nsteps = len(values)
+                start = values[0]
+                stop = values[-1]
+                step = (stop - start) / (nsteps - 1)
 
                 if sweeper.parameter == Parameter.amplitude:
-                    amplitude = QickSweep1D(name, qstart, qstop)
+                    amplitude = QickSweep1D(name, start, stop)
                     for pulse in scheduled(sweeper.pulses):
                         pulse.amplitude = amplitude
                 elif sweeper.parameter == Parameter.duration:
-                    NS_TO_US = 1e-3
-                    duration = QickSweep1D(name, qstart * NS_TO_US, qstop * NS_TO_US) 
-                    for pulse in scheduled(sweeper.pulses):
-                        pulse.duration = duration
+                    pass
+                    # NS_TO_US = 1e-3
+                    # duration = QickSweep1D(name, start * NS_TO_US, stop * NS_TO_US) 
+                    # for pulse in scheduled(sweeper.pulses):
+                    #     pulse.duration = duration
                 elif sweeper.parameter == Parameter.duration_interpolated:
-                    for pulse in scheduled(sweeper.pulses):
-                        pass
+                    pass
+                    # for pulse in scheduled(sweeper.pulses):
+                    #     pass
                 elif sweeper.parameter == Parameter.relative_phase:
                     RAD_TO_DEG = 180/np.pi
-                    relative_phase = QickSweep1D(name, qstart * RAD_TO_DEG, qstop * RAD_TO_DEG) 
+                    relative_phase = QickSweep1D(name, start * RAD_TO_DEG, stop * RAD_TO_DEG) 
                     for pulse in scheduled(sweeper.pulses):
                         pulse.relative_phase = relative_phase
                 elif sweeper.parameter == Parameter.frequency:
@@ -410,10 +460,10 @@ class TIIqModule:
                         if channel_id in self.channels:
                             if 'drive' in channel_id:
                                 sg: InterpolatedSignalGenerator = settings.drive_signal_generators[channel_id]
-                                sg.frequency = QickSweep1D(name, qstart, qstop)
+                                sg.frequency = QickSweep1D(name, start, stop)
                             elif 'flux' in channel_id:
                                 sg: FullSpeedSignalGenerator = settings.flux_signal_generators[channel_id]
-                                sg.frequency = QickSweep1D(name, qstart, qstop)
+                                sg.frequency = QickSweep1D(name, start, stop)
                             elif 'probe' in channel_id:
                                 # TODO: implement a for loop
                                 # ouput: OutputId = settings.channel_id_to_output_map[channel_id]
@@ -435,16 +485,55 @@ class TIIqModule:
                         # TODO: implement a for loop
                 else:
                     raise NotImplementedError(f"Sweeper parameter {sweeper.parameter} is not supported.")
+        return sequence
 
-        # self.add_loop("myloop", self.cfg["steps"])
-        # 'phase': QickSweep1D("myloop", -360, 720),
-        # 'gain': QickSweep1D("myloop", 0.0, 1.0),
-        # self.delay(QickSweep1D("myloop", 0.9, 1.3))
+    def _generate_scheduled_sequence(self, sequence: MutablePulseSequence) -> ScheduledPulseSequence:
+        channels: dict[ChannelId, Channel] = sequence.channels
+        time_at_channel: dict[ChannelId, float] = {}
+        for channel_id in channels:
+            time_at_channel[channel_id] = 0.0
+        scheduled_sequence: ScheduledPulseSequence = ScheduledPulseSequence()
+        scheduled_class_map={
+            MutablePulse: ScheduledPulse,
+            MutableAcquisition: ScheduledAcquisition,
+            MutableReadout: ScheduledReadout,
+            MutableDelay: ScheduledDelay,
+            MutableVirtualZ: ScheduledVirtualZ,
+        }
 
-        # self.add_loop("loop1", self.cfg["steps1"]) # this will be the outer loop
-        # self.add_loop("loop2", self.cfg["steps2"]) # this will be the inner loop
+        item: Mutable
+        for item in sequence:
+            channel_id: ChannelId = item.channel_id
+            start: float = time_at_channel[channel_id]
+            if not isinstance(item, MutableItem):
+                raise ValueError
+            else:
+                item_class = type(item)
+                scheduled_class = scheduled_class_map[item_class]
+                scheduled_item: Scheduled = scheduled_class(channel_id, start, item)
+                duration: float = float(scheduled_item.duration)
+                scheduled_sequence.add_item(scheduled_item)
+            time_at_channel[channel_id] = duration + time_at_channel[channel_id]
+        return scheduled_sequence
 
-    def _replace_readouts(self, scheduled_sequence: ScheduledPulseSequence, settings: TIIqSettings) -> ScheduledPulseSequence:
+    #####################################################################################
+
+    def _map_acquisitions_to_probes(self, configs: dict[str, Config], channels: dict[ChannelId, Channel]):
+        """Analyzes channels configuration and saves the relationships between acquisition and probe channels."""
+        for channel_id in channels:
+            config: Config = configs[channel_id]
+            channel: Channel = channels[channel_id]
+
+            if isinstance(config, TIIqAcquisitionConfig) and isinstance(channel, AcquisitionChannel):
+                probe_channel_id: ChannelId|None = channel.probe
+                if probe_channel_id is not None:
+                    self.acquisition_to_probe_map[channel_id] = probe_channel_id
+            # elif isinstance(config, TIIqProbeConfig) and isinstance(channel, ProbeChannel):
+            #     acquisition_channel_id: ChannelId|None = channel.acquisition
+            #     if acquisition_channel_id is not None:
+            #         self.acquisition_to_probe_map[acquisition_channel_id] = channel_id
+
+    def _replace_readouts(self, scheduled_sequence: ScheduledPulseSequence, acquisition_to_probe_map: dict[ChannelId, ChannelId]) -> ScheduledPulseSequence:
         no_readout_scheduled_sequence = ScheduledPulseSequence()
         for item in scheduled_sequence:
             if isinstance(item, ScheduledReadout):
@@ -452,20 +541,22 @@ class TIIqModule:
 
                 acquisition_channel_id = readout.channel_id
                 acquisition: Acquisition = readout.acquisition
-                scheduled_acquisition = ScheduledAcquisition(acquisition_channel_id, readout.start, acquisition)
+                scheduled_acquisition = ScheduledAcquisition(acquisition_channel_id, readout.start, MutableAcquisition(acquisition_channel_id, acquisition))
                 no_readout_scheduled_sequence.add_item(scheduled_acquisition)
 
                 # probe channel information is not included in the Readout object
                 # try to find it within the module channels 
-                if acquisition_channel_id in settings.acquisition_to_probe_map:
-                    probe_channel_id = settings.acquisition_to_probe_map[acquisition_channel_id]
+                if acquisition_channel_id in acquisition_to_probe_map:
+                    probe_channel_id = acquisition_to_probe_map[acquisition_channel_id]
                     probe: Pulse = readout.probe
-                    scheduled_probe = ScheduledPulse(probe_channel_id, readout.start, probe)
+                    scheduled_probe = ScheduledPulse(probe_channel_id, readout.start, MutablePulse(probe_channel_id, probe))
                     no_readout_scheduled_sequence.add_item(scheduled_probe)
             else:
                 no_readout_scheduled_sequence.add_item(item)
 
         return no_readout_scheduled_sequence
+
+    #####################################################################################
 
     def _determine_active_channels(self, scheduled_sequence: ScheduledPulseSequence, channels: dict[ChannelId, Channel], configs: dict[str, Config]) -> list[ChannelId]:
         sequence_channels: set[ChannelId] = scheduled_sequence.channels
@@ -486,24 +577,42 @@ class TIIqModule:
                 filtered_scheduled_sequence.add_item(item)
         return filtered_scheduled_sequence
 
+    #####################################################################################
+
+    def _is_channel_multiplexed(self, channel_id:ChannelId) -> bool:
+        is_multiplexed: bool = False
+        if channel_id in self.channel_id_to_output_map:
+            output: OutputId = self.channel_id_to_output_map[channel_id]
+            is_multiplexed = isinstance(self.signal_generators[output], MuxedSignalGenerator)
+        elif channel_id in self.channel_id_to_input_map:
+            input: InputId = self.channel_id_to_input_map[channel_id]
+            is_multiplexed = isinstance(self.signal_processors[input], MuxedSignalProcessor)
+        else:
+            raise ValueError("TODO")
+        return is_multiplexed
+
     def _add_port_n_multiplex_info(self, scheduled_sequence: ScheduledPulseSequence):
         for item in scheduled_sequence:
             if isinstance(item, ScheduledPulse):
                 channel_id: ChannelId = item.channel_id
-                output: OutputId = self.settings.channel_id_to_output_map[channel_id]
-                is_multiplexed: bool = self.settings.is_channel_multiplexed(channel_id)
+                output: OutputId = self.channel_id_to_output_map[channel_id]
+                is_multiplexed: bool = self._is_channel_multiplexed(channel_id)
                 item.output = output
                 item.is_multiplexed = is_multiplexed
             elif isinstance(item, ScheduledAcquisition):
                 channel_id: ChannelId = item.channel_id
-                input: InputId = self.settings.channel_id_to_input_map[channel_id]
-                is_multiplexed: bool = self.settings.is_channel_multiplexed(channel_id)
+                input: InputId = self.channel_id_to_input_map[channel_id]
+                is_multiplexed: bool = self._is_channel_multiplexed(channel_id)
                 item.input = input
                 item.is_multiplexed = is_multiplexed
+
+    #####################################################################################
 
     def _add_role_info(self, scheduled_sequence: ScheduledPulseSequence) -> ScheduledPulseSequence:
         # TODO
         return scheduled_sequence
+
+    #####################################################################################
 
     def _sort_items(self, scheduled_sequence: ScheduledPulseSequence):
         scheduled_sequence.sort()
@@ -515,6 +624,8 @@ class TIIqModule:
             previous_item_start = item.start
 
     # TODO consider merging sort and calculate lags
+
+    #####################################################################################
 
     def _group_multiplexed(self, scheduled_sequence: ScheduledPulseSequence) -> ScheduledPulseSequence:
         # it assumes the pulse sequence was sorted beforehand
@@ -557,6 +668,7 @@ class TIIqModule:
         return grouped_scheduled_sequence
 
     def _add_final_delay(self, total_duration: float, scheduled_sequence: ScheduledPulseSequence):
+        # TODO eliminate, the delay is never added because the sequence is equalized at the begining and thus all channels have same duration
         debug_print(f"""
                     total_duration: {total_duration}
                     scheduled_sequence duration: {scheduled_sequence.duration}
@@ -564,23 +676,34 @@ class TIIqModule:
         if total_duration > scheduled_sequence.duration:
             for channel_id in scheduled_sequence.channels:
                 start = scheduled_sequence.duration
-                delay = ScheduledDelay(channel_id, start, Delay(kind='delay', duration=total_duration - scheduled_sequence.duration))
+                delay = ScheduledDelay(channel_id, start, MutableDelay(channel_id, Delay(kind='delay', duration=total_duration - scheduled_sequence.duration)))
                 scheduled_sequence.add_item(delay)
+
+    #####################################################################################
 
     def _configure_active_channels(self, active_channels: list[ChannelId], configs: dict[str, Config], channels: dict[ChannelId, Channel], settings: TIIqSettings):
         for channel_id in active_channels:
             config: Config = configs[channel_id]
-            channel: Channel = self.channels[channel_id]
+            channel: Channel = channels[channel_id]
             port_id: PortId = channel.path
 
             if isinstance(config, TIIqDriveConfig):
-                settings.register_drive_channel(channel_id, config, port_id)
+                output: OutputId = self.channel_id_to_output_map[channel_id]
+                signal_generator:InterpolatedSignalGenerator = self.signal_generators[output]
+                settings.register_drive_channel(channel_id, output, signal_generator, config, port_id)
 
             elif isinstance(config, TIIqFluxConfig):
-                settings.register_flux_channel(channel_id, config, port_id)
+                output: OutputId = self.channel_id_to_output_map[channel_id]
+                if output:
+                    signal_generator: FullSpeedSignalGenerator = self.signal_generators[output]
+                else:
+                    signal_generator = None
+                settings.register_flux_channel(channel_id, output, signal_generator, config, port_id)
 
             elif isinstance(config, TIIqProbeConfig):
-                settings.register_probe_channel(channel_id, config, port_id)
+                output: OutputId = self.channel_id_to_output_map[channel_id]
+                mux_signal_generator: MuxedSignalGenerator = self.signal_generators[output]
+                settings.register_probe_channel(channel_id, output, mux_signal_generator, config, port_id)
 
             elif isinstance(config, TIIqAcquisitionConfig) and isinstance(channel, AcquisitionChannel):
                 probe_channel_id: ChannelId|None = channel.probe
@@ -594,12 +717,33 @@ class TIIqModule:
                         raise TypeError(f"Unsupported configuration {type(probe_config)} for channel {probe_channel_id}.")
                     probe_channel = channels[probe_channel_id]
                     probe_port_id = probe_channel.path
-                settings.register_acquisition_channel(channel_id, config, port_id, probe_channel_id, probe_config, probe_port_id)
+
+                    output: OutputId = self.channel_id_to_output_map[probe_channel_id]
+                    if not output in settings.probe_signal_generators:
+                        settings.register_probe_channel(probe_channel_id, probe_config, probe_port_id)
+                    mux_signal_generator: MuxedSignalGenerator = settings.probe_signal_generators[output]
+                    if not probe_channel_id in mux_signal_generator.tones:
+                        settings.register_probe_channel(probe_channel_id, probe_config, probe_port_id)
+                    tone: MuxedSignalGeneratorTone = mux_signal_generator.tones[probe_channel_id]
+
+                input: InputId = self.channel_id_to_input_map[channel_id]
+                mux_signal_processor: MuxedSignalProcessor = self.signal_processors[input]
+                settings.register_acquisition_channel(channel_id, input, mux_signal_processor, config, port_id, probe_channel_id)
 
             else:
                 raise TypeError(f"Unsupported configuration {type(config)} for channel {channel_id}.")
 
     def _register_pulses_and_acquisitions(self, scheduled_sequence: ScheduledPulseSequence, settings: TIIqSettings):
+        # sg: SignalGeneratorsType
+        # for sg in self.signal_generators: 
+        #     sg.pulses = []
+        #     sg.waveforms = {}
+        # sp: SignalProcessorsType
+        # for sp in self.signal_processors:
+        #     tone: MuxedSignalProcessorTone
+        #     for tone in sp.tones:
+        #         tone.acquisitions = []
+
         for item in scheduled_sequence:
             if isinstance(item, ScheduledPulse):
                 settings.register_pulse(item)
@@ -613,6 +757,92 @@ class TIIqModule:
             # else:
             #     raise ValueError("TODO")
 
+    #####################################################################################
+
+    def _fl_sweeper_recursive(self, fl_sweepers: list[ParallelSweepers], mutable_sequence: MutablePulseSequence):
+        if len (fl_sweepers) > 0:
+            parallel_sweeper_set = fl_sweepers.pop(0)
+            nreps = len(parallel_sweeper_set[0].values)
+            for iteration in range(nreps):
+                for sweeper in parallel_sweeper_set:
+                    if sweeper.parameter is Parameter.duration:
+                        for pulse in sweeper.pulses:
+                            p = mutable_sequence.get_item(pulse.id)
+                            p.duration = sweeper.values[iteration]
+                    elif sweeper.parameter is Parameter.amplitude:
+                        for pulse in sweeper.pulses:
+                            p = mutable_sequence.get_item(pulse.id)
+                            p.amplitude = sweeper.values[iteration]
+                    pass
+                self._fl_sweeper_recursive(fl_sweepers.copy(), mutable_sequence)
+        else:
+            # inputs
+            channels: dict[ChannelId, Channel] = self.channels
+            settings: TIIqSettings = TIIqSettings()
+            configs: dict[str, Config] = self.configs
+            options: ExecutionParameters = self.options
+            firmware_configuration: QickConfig = self.firmware_configuration
+            acquisition_to_probe_map: dict[ChannelId, ChannelId] = self.acquisition_to_probe_map
+            rt_sweepers: list[ParallelSweepers] = self.rt_sweepers
+            # local variables
+            sequence_total_duration: float
+            mutable_sequence: MutablePulseSequence
+            program: TIIqProgram
+            # outputs
+            active_channels: list[ChannelId]
+            scheduled_sequence: ScheduledPulseSequence
+
+            mutable_sequence = self._process_rt_sweepers(mutable_sequence, rt_sweepers, settings)
+            scheduled_sequence = self._generate_scheduled_sequence(mutable_sequence)
+            self._map_acquisitions_to_probes(configs, channels)
+            scheduled_sequence = self._replace_readouts(scheduled_sequence, acquisition_to_probe_map)
+            sequence_total_duration = scheduled_sequence.duration
+            active_channels = self._determine_active_channels(scheduled_sequence, channels, configs)
+            scheduled_sequence = self._filter_channels(scheduled_sequence, active_channels)
+            self._add_port_n_multiplex_info(scheduled_sequence)
+            self._add_role_info(scheduled_sequence)
+            self._sort_items(scheduled_sequence) 
+            self._calculate_lags(scheduled_sequence)
+            scheduled_sequence = self._group_multiplexed(scheduled_sequence)
+            self._add_final_delay(sequence_total_duration, scheduled_sequence)
+            
+            self.active_channels = active_channels
+            self.scheduled_sequence = scheduled_sequence
+            
+            # TODO: fix readout pulse gain not working
+            # TODO: pulse duration sweeper does not affect the start of the next pulses
+
+            debug_print(scheduled_sequence)
+
+            # # configure modules and ports
+            self._configure_active_channels(active_channels, configs, channels, settings)
+            
+            # # register pulses and acquisitions
+            self._register_pulses_and_acquisitions(scheduled_sequence, settings)
+
+
+            # generate program
+            program = TIIqProgram(
+                firmware_configuration=firmware_configuration,
+                module_settings = settings,
+                scheduled_sequence=scheduled_sequence,
+                sequence_total_duration=sequence_total_duration,
+                nshots=options.nshots,
+                relaxation_time=options.relaxation_time
+            )
+            debug_print(program)
+            self.programs.append(program)
+
+            if modes.enable(DEBUG):
+                import json
+                from qick.helpers import progs2json
+                # debug_print(json.dumps(self.program.envelopes, indent=2))
+                # debug_print(json.dumps(self.program.waves, indent=2))
+                dump = self.program.dump_prog()
+                # del dump["prog_list"]
+                # debug_print(progs2json(dump))
+                with open(f"prog_{self.address}.json", "w") as file:
+                    file.write(progs2json(dump))
 
     def prepare_execution(
         self,
@@ -626,67 +856,22 @@ class TIIqModule:
         for item in sequence:
             debug_print(item)
 
-        sequence_total_duration: float
-        scheduled_sequence: ScheduledPulseSequence
-        active_channels: list[ChannelId]
-        channels: dict[ChannelId, Channel] = self.channels
-        settings: TIIqSettings = self.settings
-        firmware_configuration: QickConfig = self.firmware_configuration
+        new_sequence: PulseSequence
+        mutable_sequence: MutablePulseSequence
 
         # process sequence and sweepers
-        sequence_total_duration = sequence.duration
-        self._syncronize(sequence)
-        self._map_acquisitions_to_probes(configs, channels, settings)
-        scheduled_sequence = self._generate_scheduled_sequence(sequence)
-        self._process_sweepers(scheduled_sequence, sweepers, settings)
-        scheduled_sequence = self._replace_readouts(scheduled_sequence, settings)
-        active_channels = self._determine_active_channels(scheduled_sequence, channels, configs)
-        scheduled_sequence = self._filter_channels(scheduled_sequence, active_channels)
-        self._add_port_n_multiplex_info(scheduled_sequence)
-        self._add_role_info(scheduled_sequence)
-        self._sort_items(scheduled_sequence) 
-        self._calculate_lags(scheduled_sequence)
-        scheduled_sequence = self._group_multiplexed(scheduled_sequence)
-        self._add_final_delay(sequence_total_duration, scheduled_sequence)
-        
+        new_sequence = self._create_sequence_copy(sequence)
+        new_sequence = self._replace_aligns_with_delays(new_sequence)
+        new_sequence = self._equalize_channel_durations(new_sequence)
+        mutable_sequence = self._generate_mutable_sequence(new_sequence)
+
+        fl_sweepers, rt_sweepers = self._separate_fl_and_rt_sweepers(sweepers)
         self.configs = configs
-        self.active_channels = active_channels
-        self.scheduled_sequence = scheduled_sequence
-        
-        # TODO: fix readout pulse gain not working
-        # TODO: pulse duration sweeper does not affect the start of the next pulses
-
-        debug_print(scheduled_sequence)
-
-        # configure modules and ports
-        self._configure_active_channels(active_channels, configs, channels, settings)
-        
-        # register pulses and acquisitions
-        self._register_pulses_and_acquisitions(scheduled_sequence, settings)
-
-        # generate program
-        program = TIIqProgram(
-            module_settings = settings,
-            firmware_configuration=firmware_configuration,
-            scheduled_sequence=scheduled_sequence,
-            sequence_total_duration=sequence_total_duration,
-            nshots=options.nshots,
-            relaxation_time=options.relaxation_time
-        )
-        debug_print(program)
-
-        self.program = program
-        
-        import json
-        from qick.helpers import progs2json
-        # debug_print(json.dumps(self.program.envelopes, indent=2))
-        # debug_print(json.dumps(self.program.waves, indent=2))
-        dump = self.program.dump_prog()
-        # del dump["prog_list"]
-        # debug_print(json.dumps(dump, indent=2))
-        # progs2json(dump)
-        with open(f"prog_{self.address}.json", "w") as file:
-            file.write(progs2json(dump))
+        self.options = options
+        self.fl_sweepers = fl_sweepers
+        self.rt_sweepers = rt_sweepers
+        self.programs: list[TIIqProgram] = []
+        self._fl_sweeper_recursive(fl_sweepers.copy(), mutable_sequence)
 
     def execute(
         self,
@@ -705,13 +890,16 @@ class TIIqModule:
             # bias_channel: BiassingChannel
             # for bias_channel in self.settings.flux_biassing_channels.values():
             #     self.tidac.set_bias(int(bias_channel.dac), bias_value=bias_channel.bias)
+            program: TIIqProgram
+            for program in self.programs:
 
-            if any([isinstance(item, (ScheduledAcquisition, ScheduledMultiplexedAcquisitions)) for item in self.scheduled_sequence]):
-                iq_list = self.program.acquire(self.soc, soft_avgs=1, load_pulses=True, start_src=self.settings.trigger_source, threshold=None, angle=None, progress=False, remove_offset=True)
-                # iq_list = self.program.acquire_decimated(self.soc, soft_avgs=1, start_src=self.settings.trigger_source)
-            else:
-                # self.program.run(self.soc, load_prog=True, load_pulses=True, start_src=self.settings.trigger_source)
-                self.program.run_rounds(self.soc, rounds=1, load_pulses=True, start_src=self.settings.trigger_source, progress=False)
+                if any([isinstance(item, (ScheduledAcquisition, ScheduledMultiplexedAcquisitions)) for item in self.scheduled_sequence]):
+                    iq_list = program.acquire(self.soc, soft_avgs=1, load_pulses=True, start_src=self.trigger_source, threshold=None, angle=None, progress=False, remove_offset=True)
+                    # iq_list = self.program.acquire_decimated(self.soc, soft_avgs=1, start_src=self.trigger_source)
+                else:
+                    # self.program.run(self.soc, load_prog=True, load_pulses=True, start_src=self.trigger_source)
+                    program.run_rounds(self.soc, rounds=1, load_pulses=True, start_src=self.trigger_source, progress=False)
+                
             
             self._reset_bias()
             print(f"{self.address} completed execution")
