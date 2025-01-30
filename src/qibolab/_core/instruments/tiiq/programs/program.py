@@ -34,9 +34,9 @@ MHZ_TO_GHZ = 1e-3
 NS_TO_US = 1e-3
 RAD_TO_DEG = 180/np.pi
 
-INITIALIZATION_TIME: float = 2000.0 # ns
-READOUT_LAG: float = 51 # ns
-FLUX_LAG: float = 20 # ns  # TODO Agustin to measure
+INITIALIZATION_TIME: float = 0.0 # ns
+READOUT_LAG: float = 0 #78 # ns
+FLUX_LAG: float = 0 # ns  # TODO Agustin to measure
 
 
 class TIIqProgram(AveragerProgramV2):
@@ -304,6 +304,8 @@ class TIIqProgram(AveragerProgramV2):
         scheduled_item: ScheduledItem
 
         qick.sync()
+        qick.wait(t=50 * NS_TO_US)
+        qick.delay(t=50 * NS_TO_US)
         for scheduled_item in self.scheduled_sequence:
             lag: float = scheduled_item.lag
             if lag != 0.0:
@@ -326,5 +328,6 @@ class TIIqProgram(AveragerProgramV2):
         last_item: ScheduledItem = scheduled_item
         # if (self.sequence_total_duration - last_item.start) > 0:
         #     qick.delay(t=(self.sequence_total_duration - last_item.start) * NS_TO_US)
-        qick.wait(t=0)
-        qick.delay(t=self.relaxation_time * NS_TO_US)
+        # qick.wait(t=0)
+        # qick.delay(t=self.relaxation_time * NS_TO_US)
+        qick.wait(t=self.relaxation_time * NS_TO_US)

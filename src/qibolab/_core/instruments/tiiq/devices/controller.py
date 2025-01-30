@@ -29,7 +29,7 @@ BOUNDS = Bounds(waveforms=1, readout=1, instructions=1)
 modes.enable(DEMO) # generates random values for the results
 # TODO: remove once the code to process the results is implemented
 modes.enable(DEBUG) # enables debug messages
-modes.enable(SIMULATION) # generates module program and configuration without executing
+# modes.enable(SIMULATION) # generates module program and configuration without executing
 
 
 # pydantic
@@ -110,7 +110,7 @@ class TIIqController(Controller):
         Returns a mapping with the id of the probe pulses used to acquired data.
         """
         log.info(f"{self.signature} playing sequences.")
-             
+        # TODO if play was called before connecting, then issue wanring and try to connect or default to simulation.
         # unroll sequences
         if len(sequences) == 0:
             return {}
@@ -149,7 +149,7 @@ class TIIqController(Controller):
             for module_id in threads:
                 threads[module_id].join()
 
-        log.info(f"all modules completed execution")
+        log.debug(f"all modules completed execution")
 
         # return results
         results: dict[int, Result] = {}

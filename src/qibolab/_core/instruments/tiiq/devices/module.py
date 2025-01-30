@@ -208,6 +208,7 @@ class TIIqModule:
                         {e}
                         Switching to simulation mode.
                         """)
+            raise Exception
             modes.enable(SIMULATION)
             self.firmware_configuration = self._load_cached_firmware_configuration()
 
@@ -327,7 +328,7 @@ class TIIqModule:
             # TODO Qibolab issue, sweeper pulse does not contain information about the channel
             # to get it I have to check in the PulseSequence.pulse_channels()
             # or else I have to create my own Sweeper object and pass that info...
-            is_rt_sweeper = False
+            is_rt_sweeper = True
             # if all(pulse.channel in supported for pulse in sweeper.pulses):
             #     is_rt_sweeper = True
             # drive pulses -> True
@@ -370,9 +371,10 @@ class TIIqModule:
 
     def _create_sequence_copy(self, sequence: PulseSequence) -> PulseSequence:
         """Create a copy of the sequence."""
+        # TODO This routine creates a new sequence but it references the same pulses and delays
         new_sequence = PulseSequence()
         for channel_id, pulse_like in sequence:
-            new_sequence.append((channel_id, pulse_like))
+            new_sequence.append((channel_id, pulse_like)) 
         return new_sequence
 
     def _replace_aligns_with_delays(self, sequence: PulseSequence) -> PulseSequence:
@@ -584,6 +586,8 @@ class TIIqModule:
         if channel_id in self.channel_id_to_output_map:
             output: OutputId = self.channel_id_to_output_map[channel_id]
             is_multiplexed = isinstance(self.signal_generators[output], MuxedSignalGenerator)
+            # TODO check if the output is None and throw error explaining that there was an attempt to 
+            # play a pulse in a flux channel that only supports DC biasing 
         elif channel_id in self.channel_id_to_input_map:
             input: InputId = self.channel_id_to_input_map[channel_id]
             is_multiplexed = isinstance(self.signal_processors[input], MuxedSignalProcessor)
@@ -669,10 +673,10 @@ class TIIqModule:
 
     def _add_final_delay(self, total_duration: float, scheduled_sequence: ScheduledPulseSequence):
         # TODO eliminate, the delay is never added because the sequence is equalized at the begining and thus all channels have same duration
-        debug_print(f"""
-                    total_duration: {total_duration}
-                    scheduled_sequence duration: {scheduled_sequence.duration}
-                    """)
+        # debug_print(f"""
+        #             total_duration: {total_duration}
+        #             scheduled_sequence duration: {scheduled_sequence.duration}
+        #             """)
         if total_duration > scheduled_sequence.duration:
             for channel_id in scheduled_sequence.channels:
                 start = scheduled_sequence.duration
@@ -769,12 +773,14 @@ class TIIqModule:
                         for pulse in sweeper.pulses:
                             p = mutable_sequence.get_item(pulse.id)
                             p.duration = sweeper.values[iteration]
+                            if iteration == 11:
+                                pass
                     elif sweeper.parameter is Parameter.amplitude:
                         for pulse in sweeper.pulses:
                             p = mutable_sequence.get_item(pulse.id)
                             p.amplitude = sweeper.values[iteration]
                     pass
-                self._fl_sweeper_recursive(fl_sweepers.copy(), mutable_sequence)
+                self._fl_sweeper_recursive(fl_sweepers.copy(), mutable_sequence.copy())
         else:
             # inputs
             channels: dict[ChannelId, Channel] = self.channels
@@ -792,6 +798,8 @@ class TIIqModule:
             active_channels: list[ChannelId]
             scheduled_sequence: ScheduledPulseSequence
 
+            # debug_print(mutable_sequence)
+
             mutable_sequence = self._process_rt_sweepers(mutable_sequence, rt_sweepers, settings)
             scheduled_sequence = self._generate_scheduled_sequence(mutable_sequence)
             self._map_acquisitions_to_probes(configs, channels)
@@ -802,9 +810,9 @@ class TIIqModule:
             self._add_port_n_multiplex_info(scheduled_sequence)
             self._add_role_info(scheduled_sequence)
             self._sort_items(scheduled_sequence) 
+            self._add_final_delay(sequence_total_duration, scheduled_sequence)
             self._calculate_lags(scheduled_sequence)
             scheduled_sequence = self._group_multiplexed(scheduled_sequence)
-            self._add_final_delay(sequence_total_duration, scheduled_sequence)
             
             self.active_channels = active_channels
             self.scheduled_sequence = scheduled_sequence
@@ -812,14 +820,14 @@ class TIIqModule:
             # TODO: fix readout pulse gain not working
             # TODO: pulse duration sweeper does not affect the start of the next pulses
 
-            debug_print(scheduled_sequence)
+            # debug_print(scheduled_sequence)
 
             # # configure modules and ports
             self._configure_active_channels(active_channels, configs, channels, settings)
             
             # # register pulses and acquisitions
             self._register_pulses_and_acquisitions(scheduled_sequence, settings)
-
+            settings.rt_sweepers = [(f"Sweeper({rt_sweeper_set[0].parameter}, {len(rt_sweeper_set[0].values)})", len(rt_sweeper_set[0].values)) for rt_sweeper_set in rt_sweepers]
 
             # generate program
             program = TIIqProgram(
@@ -830,15 +838,15 @@ class TIIqModule:
                 nshots=options.nshots,
                 relaxation_time=options.relaxation_time
             )
-            debug_print(program)
+            # debug_print(program)
             self.programs.append(program)
 
-            if modes.enable(DEBUG):
+            if modes.is_enabled(DEBUG):
                 import json
                 from qick.helpers import progs2json
                 # debug_print(json.dumps(self.program.envelopes, indent=2))
                 # debug_print(json.dumps(self.program.waves, indent=2))
-                dump = self.program.dump_prog()
+                dump = program.dump_prog()
                 # del dump["prog_list"]
                 # debug_print(progs2json(dump))
                 with open(f"prog_{self.address}.json", "w") as file:
@@ -851,10 +859,10 @@ class TIIqModule:
         options: ExecutionParameters,
         sweepers: list[ParallelSweepers]
     ):
-        debug_print(f"\nModule {self.address}")
+        # debug_print(f"\nModule {self.address}")
         
-        for item in sequence:
-            debug_print(item)
+        # for item in sequence:
+        #     debug_print(item)
 
         new_sequence: PulseSequence
         mutable_sequence: MutablePulseSequence
@@ -871,7 +879,7 @@ class TIIqModule:
         self.fl_sweepers = fl_sweepers
         self.rt_sweepers = rt_sweepers
         self.programs: list[TIIqProgram] = []
-        self._fl_sweeper_recursive(fl_sweepers.copy(), mutable_sequence)
+        self._fl_sweeper_recursive(fl_sweepers.copy(), mutable_sequence.copy())
 
     def execute(
         self,
@@ -890,6 +898,7 @@ class TIIqModule:
             # bias_channel: BiassingChannel
             # for bias_channel in self.settings.flux_biassing_channels.values():
             #     self.tidac.set_bias(int(bias_channel.dac), bias_value=bias_channel.bias)
+            # debug_print(self.programs[0])
             program: TIIqProgram
             for program in self.programs:
 

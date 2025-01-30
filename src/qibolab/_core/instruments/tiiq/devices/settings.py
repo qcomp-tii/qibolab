@@ -74,7 +74,7 @@ class InterpolatedSignalGenerator():
     # pulses: list[PulseLike] = field(default_factory=list)
     # waveforms: dict[str, IqWaveform] = field(default_factory=list)
 
-DEFAULT_FREQUENCY: float = 0.0
+DEFAULT_FREQUENCY: float = 7000000000.0
 DEFAULT_GAIN: float = 0.0
 DEFAULT_PHASE: float = 0.0
 
