@@ -295,7 +295,7 @@ class TIIqProgram(AveragerProgramV2):
         self._initialize_flux_signal_generators()
         self._initialize_probe_signal_generators()
         self._initialize_acquisition_signal_processors()
-        # qick.sync()
+        qick.config_external_flag()
 
     def _body(self, cfg:dict):
         qick = self

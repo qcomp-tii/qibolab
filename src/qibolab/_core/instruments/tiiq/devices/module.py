@@ -1,3 +1,4 @@
+import numpy as np
 import pathlib
 from dataclasses import dataclass, field, asdict
 from Pyro4 import Proxy
@@ -315,8 +316,8 @@ class TIIqModule:
     def _is_rt_sweeper(self, sweeper: Sweeper) -> bool:
         is_rt_sweeper: bool = False
         if sweeper.parameter == Parameter.frequency:
-            supported = []
-            if all(channel in supported for channel in sweeper.channels):
+            supported_channel_types = ['drive', 'flux']
+            if all(supported_channel_type in channel for channel in sweeper.channels for supported_channel_type in supported_channel_types):
                 is_rt_sweeper = True
             # drive pulses -> True
             # flux pulses -> True
@@ -650,10 +651,10 @@ class TIIqModule:
                     # create a new multiplexed item
                     multiplexed_pulses = ScheduledMultiplexedPulses(output=output, lag=item.lag)
                     multiplexed_pulses.append(item)
-                    output_start_tracker[output] = item.start
-
-                if item.start == output_start_tracker[output]:
                     grouped_scheduled_sequence.add_item(multiplexed_pulses)
+                    output_start_tracker[output] = item.start
+                else:
+                    multiplexed_pulses.append(item)
 
             elif isinstance(item, ScheduledAcquisition) and item.is_multiplexed:
                 input: InputId = item.input
@@ -661,10 +662,10 @@ class TIIqModule:
                     # create a new multiplexed item
                     multiplexed_acquisitions = ScheduledMultiplexedAcquisitions(input=input, lag=item.lag)
                     multiplexed_acquisitions.append(item)
-                    input_start_tracker[input] = item.start
-
-                if item.start == input_start_tracker[input]:
                     grouped_scheduled_sequence.add_item(multiplexed_acquisitions)
+                    input_start_tracker[input] = item.start
+                else:
+                    multiplexed_acquisitions.append(item)
 
             else:
                     grouped_scheduled_sequence.add_item(item)
@@ -779,6 +780,9 @@ class TIIqModule:
                         for pulse in sweeper.pulses:
                             p = mutable_sequence.get_item(pulse.id)
                             p.amplitude = sweeper.values[iteration]
+                    elif sweeper.parameter is Parameter.frequency:
+                        for channel in sweeper.channels:
+                            self.configs[channel] = self.configs[channel].model_copy(update={'frequency': sweeper.values[iteration]})
                     pass
                 self._fl_sweeper_recursive(fl_sweepers.copy(), mutable_sequence.copy())
         else:
@@ -893,18 +897,47 @@ class TIIqModule:
         """
 
 
+
+
+
         if not modes.is_enabled(SIMULATION):
             # set flux
             # bias_channel: BiassingChannel
             # for bias_channel in self.settings.flux_biassing_channels.values():
             #     self.tidac.set_bias(int(bias_channel.dac), bias_value=bias_channel.bias)
             # debug_print(self.programs[0])
+
+            results = {}
+            acquisition_counter = 0
+            for item in self.scheduled_sequence:
+                if isinstance(item, ScheduledMultiplexedAcquisitions):
+                    for acquisition in item.acquisitions:
+                        results[acquisition.id] = np.empty((0, 2))
+                        acquisition_counter += 1
+                        
+                elif isinstance(item, ScheduledAcquisition):
+                    results[item.id] = np.empty((0, 2))
+                    acquisition_counter += 1
+
+
+
             program: TIIqProgram
             for program in self.programs:
 
                 if any([isinstance(item, (ScheduledAcquisition, ScheduledMultiplexedAcquisitions)) for item in self.scheduled_sequence]):
                     iq_list = program.acquire(self.soc, soft_avgs=1, load_pulses=True, start_src=self.trigger_source, threshold=None, angle=None, progress=False, remove_offset=True)
                     # iq_list = self.program.acquire_decimated(self.soc, soft_avgs=1, start_src=self.trigger_source)
+                    acquisition_counter = 0
+                    for item in self.scheduled_sequence:
+                        if isinstance(item, ScheduledMultiplexedAcquisitions):
+                            for acquisition in item.acquisitions:
+                                results[acquisition.id] = np.vstack([results[acquisition.id], iq_list[acquisition_counter]])
+                                acquisition_counter += 1
+                                
+                        elif isinstance(item, ScheduledAcquisition):
+                            results[item.id] = np.vstack([results[item.id], iq_list[acquisition_counter]])
+                            acquisition_counter += 1
+
                 else:
                     # self.program.run(self.soc, load_prog=True, load_pulses=True, start_src=self.trigger_source)
                     program.run_rounds(self.soc, rounds=1, load_pulses=True, start_src=self.trigger_source, progress=False)
@@ -912,6 +945,7 @@ class TIIqModule:
             
             self._reset_bias()
             print(f"{self.address} completed execution")
+
 
         # TODO check if there are not acquisitions, if so, then run rounds instead of acquire
         # TODO test that all of the programs have the same length
@@ -929,7 +963,7 @@ class TIIqModule:
 
         #   schedule pulses & acquisitions
         #   modify paramenters
-        return {}
+        return results
 
 
 

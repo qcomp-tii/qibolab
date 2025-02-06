@@ -29,7 +29,7 @@ BOUNDS = Bounds(waveforms=1, readout=1, instructions=1)
 modes.enable(DEMO) # generates random values for the results
 # TODO: remove once the code to process the results is implemented
 modes.enable(DEBUG) # enables debug messages
-# modes.enable(SIMULATION) # generates module program and configuration without executing
+modes.enable(SIMULATION) # generates module program and configuration without executing
 
 
 # pydantic
@@ -132,6 +132,7 @@ class TIIqController(Controller):
         module_id: str
         module: TIIqModule
         module_results: dict[str, dict[int, Result]] = {}
+        lock = threading.Lock()
         if modes.is_enabled(SIMULATION):
             for module_id, module in self.modules.items():
                 module_results[module_id] = module.execute()
@@ -139,9 +140,12 @@ class TIIqController(Controller):
             threads: dict[str, threading.Thread] = {}
             # Create and start threads
             for module_id, module in self.modules.items():
-                    def thread_target(mod=module):
-                        log.debug(f"Starting thread for module {module_id}.")
-                        module_results[module_id] = mod.execute()
+                    def thread_target(mid=module_id, mod=module):
+                        log.debug(f"Starting thread for module {mid}.")
+                        res = mod.execute()
+                        with lock:
+                            log.debug(f"Saving results for module {mid}.")
+                            module_results[mid] = res
                     threads[module_id] = threading.Thread(target=thread_target)
                     threads[module_id].start()
 

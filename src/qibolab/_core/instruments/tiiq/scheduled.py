@@ -23,14 +23,15 @@ __all__ = [
 
 
 class Mutable():
-    id: PulseId
     channel_id: ChannelId
     _original: PulseLike
-    attr_names: list[str] = ['id']
+    attr_names: list[str]
+    id: PulseId
 
     def __init__(self, channel_id: ChannelId, pulse_like: PulseLike):
         self.channel_id = channel_id
         self._original = pulse_like
+        self.attr_names = ['id']
 
     def __getattr__(self, name):
         # check if the attribute exists
@@ -44,6 +45,14 @@ class Mutable():
     def __repr__(self):
         attrs = ", ".join(f"{name}={getattr(self, name, None)!r}" for name in self.attr_names)
         return f"{self.__class__.__name__}({attrs})"
+
+    def copy(self):
+        """Return a copy of the mutable item."""
+        new_item = self.__class__(self.channel_id, self._original)
+        for k in self.attr_names:
+            v = getattr(self, k, None)
+            setattr(new_item, k, v)
+        return new_item
 
 
 class MutablePulse(Mutable):
@@ -115,7 +124,6 @@ class MutablePulseSequence():
             self._data.append(item)
             self._id_map[item.id] = item
 
-
     def get_item(self, item_id: PulseId) -> MutableItem | None:
         """
         Retrieve an item by its ID.
@@ -127,6 +135,15 @@ class MutablePulseSequence():
 
     def remove_item(self, item: MutableItem):
         self._data.remove(self._id_map.pop(item.id))
+    
+    def get_channel_items(self, channel_id: ChannelId) -> list[MutableItem]:
+        """
+        Retrieve all items associated with a given channel.
+
+        :param channel_id: The unique ID of the channel.
+        :return: A list of MutableItem objects associated with the channel.
+        """
+        return [item for item in self._data if item.channel_id == channel_id]
 
     def __iter__(self):
         return iter(self._data)
@@ -147,6 +164,13 @@ class MutablePulseSequence():
         items = "\n\t".join(repr(item) for item in self._data)
         return f"{self.__class__.__name__}({attrs})\n\t{items}"
 
+    def copy(self):
+        """Return a copy of the mutable pulse sequence."""
+        new_sequence = MutablePulseSequence()
+        for item in self._data:
+            new_item: Mutable = item.copy()
+            new_sequence.add_item(new_item)
+        return new_sequence
 
 class Scheduled(Mutable):
     start: float
@@ -156,9 +180,10 @@ class Scheduled(Mutable):
     def __init__(self, channel_id: ChannelId, start:float, item: MutableItem):
         pulse_like: PulseLike = item._original
         super().__init__(channel_id, pulse_like)
-        for k, v in item.__dict__.items():
+        for k in item.attr_names:
+            v = getattr(item, k, None)
             setattr(self, k, v)
-        self.attr_names += ['channel_id', 'start', 'lag', 'duration']
+        self.attr_names = item.attr_names + ['start', 'lag']
         self.start = start
         self.lag = None
 
